@@ -68,39 +68,79 @@ PoS 过渡：Geth 在性能和与新兴以太坊升级（如以太坊 2.0 中从
 ## 3.1 分层架构图
 以下是 Geth 简化后的核心分层架构图，展示了各层级之间的依赖关系：
 
-​```plantuml
-@startuml
-package "P2P网络层" as NetworkLayer {
-  [P2P协议] 
-  [RLPx传输]
-  [节点发现]
-}
+--------------------------------------------------
 
-package "区块链协议层" as ProtocolLayer {
-  [区块链同步]
-  [交易池]
-  [共识引擎]
-}
+```mermaid
+graph TB
+    %% P2P网络层
+    subgraph P2P网络层
+        A1[P2P协议]
+        A2[RLPx传输]
+        A3[节点发现]
+        A4[轻节点协议 LES]
+    end
+    
+    %% 区块链协议层
+    subgraph 区块链协议层
+        B1[区块链同步]
+        B2[交易池管理]
+        B3[共识引擎]
+        B4[Gas机制]
+    end
+    
+    %% 状态存储层
+    subgraph 状态存储层
+        C1[状态机]
+        C2[Trie/MPT实现]
+        C3[LevelDB存储]
+        C4[core/types数据结构]
+    end
+    
+    %% EVM执行层
+    subgraph EVM执行层
+        D1[EVM虚拟机]
+        D2[字节码解释器]
+        D3[Gas计算器]
+        D4[智能合约执行]
+    end
+    
+    %% 层间依赖关系
+    A1 --> B1
+    A2 --> B1
+    A3 --> B1
+    A4 --> B2
+    
+    B1 --> C1
+    B2 --> C1
+    B3 --> C1
+    B4 --> D3
+    
+    C1 --> D1
+    C2 --> C1
+    C3 --> C2
+    C4 --> C1
+    
+    D1 --> D2
+    D2 --> D3
+    D3 --> D4
+    
+    %% 双向关系
+    C1 -.-> D4
+    D4 -.-> C1
+    
+    %% 样式定义
+    classDef networkLayer fill:#e1f5fe
+    classDef protocolLayer fill:#f3e5f5
+    classDef storageLayer fill:#e8f5e8
+    classDef executionLayer fill:#fff3e0
+    
+    class A1,A2,A3,A4 networkLayer
+    class B1,B2,B3,B4 protocolLayer
+    class C1,C2,C3,C4 storageLayer
+    class D1,D2,D3,D4 executionLayer
+```
 
-package "状态存储层" as StorageLayer {
-  [状态机]
-  [Trie(MPT)]
-  [LevelDB]
-}
-
-package "EVM执行层" as ExecutionLayer {
-  [EVM]
-  [解释器]
-  [Gas计算]
-}
-
-NetworkLayer --> ProtocolLayer
-ProtocolLayer --> StorageLayer
-ProtocolLayer --> ExecutionLayer
-StorageLayer <--> ExecutionLayer
-@enduml
-​```
-
+--------------------------------------------------
 ## 3.2 各层关键模块说明
 ### 3.2.1 P2P 网络层
 该层负责节点间的网络通信和数据交换。
