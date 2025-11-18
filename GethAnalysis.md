@@ -145,46 +145,559 @@ graph TB
 ### 3.2.1 P2P 网络层
 该层负责节点间的网络通信和数据交换，包含以下核心模块：
 
-P2P协议：基于 DevP2P 的协议栈，负责建立和维护节点连接
+1. P2P协议：基于 DevP2P 的协议栈，负责建立和维护节点连接
 
-RLPx传输：提供加密的点到点通信通道
+2. RLPx传输：提供加密的点到点通信通道
 
-节点发现：基于 Kademlia DHT 协议实现节点动态发现
+3. 节点发现：基于 Kademlia DHT 协议实现节点动态发现
 
-轻节点协议（LES）：允许轻节点与全节点交互，降低资源消耗
+4. 轻节点协议（LES）：允许轻节点与全节点交互，降低资源消耗
 
+**核心代码**
+#### **P2P 协议实现**
+```go
+// p2p/server.go - P2P 服务器核心结构
+type Server struct {
+    // 配置参数
+    Config
+    // 节点数据库
+    nodeDB *enode.DB
+    // 运行状态
+    running map[reflect.Type]bool
+    // 协议管理器
+    protocols []Protocol
+    // 对等节点列表
+    peers map[*Peer]bool
+    // 添加对等节点的通道
+    addpeer chan *Peer
+    // 删除对等节点的通道
+    delpeer chan peerDrop
+}
+
+// 启动 P2P 服务器
+func (srv *Server) Start() error {
+    if err := srv.setupLocalNode(); err != nil {
+        return err
+    }
+    if srv.ListenAddr != "" {
+        if err := srv.setupListening(); err != nil {
+            return err
+        }
+    }
+    if err := srv.setupDiscovery(); err != nil {
+        return err
+    }
+    srv.loop()
+    return nil
+}
+
+// 节点发现协议
+func (srv *Server) setupDiscovery() error {
+    // 使用 Kademlia DHT 进行节点发现
+    discv, err := discover.ListenUDP(srv.PrivateKey, srv.ListenAddr, srv.NodeDatabase)
+    if err != nil {
+        return err
+    }
+    srv.discv = discv
+    return nil
+}
+```
+#### **轻节点协议 (LES)** 
+```go
+// les/client.go - 轻客户端实现
+type LightEthereum struct {
+    // 配置
+    config *eth.Config
+    // 对等节点集合
+    peers        *peerSet
+    // 请求分发器
+    reqDist      *requestDistributor
+    // 区块链
+    blockchain   *light.LightChain
+    // 交易池
+    txPool       *light.TxPool
+    // 协议管理器
+    protocolManager *ProtocolManager
+}
+
+// LES 协议处理
+func (pm *ProtocolManager) handleMsg(p *peer) error {
+    msg, err := p.rw.ReadMsg()
+    if err != nil {
+        return err
+    }
+    defer msg.Discard()
+
+    switch msg.Code {
+    case GetBlockHeadersMsg:
+        // 处理获取区块头请求
+        var query getBlockHeadersData
+        if err := msg.Decode(&query); err != nil {
+            return err
+        }
+        headers := pm.getBlockHeaders(p, &query)
+        return p.SendBlockHeaders(headers)
+    
+    case GetBlockBodiesMsg:
+        // 处理获取区块体请求
+        var req getBlockBodiesData
+        if err := msg.Decode(&req); err != nil {
+            return err
+        }
+        bodies := pm.getBlockBodies(p, req)
+        return p.SendBlockBodies(bodies)
+    
+    // 其他消息处理...
+    }
+    return nil
+}
+```
 ### 3.2.2 区块链协议层
 该层处理区块链的核心逻辑和共识机制：
 
-区块链同步：支持快速同步和完全同步等多种同步策略
+1. 区块链同步：支持快速同步和完全同步等多种同步策略
 
-交易池管理：验证交易合法性，按 Gas 价格排序并管理待确认交易
+2.  交易池管理：验证交易合法性，按 Gas 价格排序并管理待确认交易
 
-共识引擎：可插拔的共识算法组件（Ethash/PoS）
+3.  共识引擎：可插拔的共识算法组件（Ethash/PoS）
 
-Gas机制：计算资源消耗的计量和费用体系
+4.   Gas机制：计算资源消耗的计量和费用体系
+
+**核心代码**
+#### **交易池管理**
+```go
+// core/tx_pool.go - 交易池核心实现
+type TxPool struct {
+    config       TxPoolConfig
+    chainconfig  *params.ChainConfig
+    chain        blockChain
+    gasPrice     *big.Int
+    // 待处理交易
+    pending      map[common.Address]*txList
+    // 队列中的交易
+    queue        map[common.Address]*txList
+    // 所有交易
+    all          *txLookup
+    // 价格堆，用于按 Gas 价格排序
+    priced       *txPricedList
+}
+
+// 添加交易到交易池
+func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err error) {
+    // 验证交易基本格式
+    if err := pool.validateTx(tx, local); err != nil {
+        return false, err
+    }
+    
+    // 检查 Nonce 连续性
+    from, _ := types.Sender(pool.signer, tx)
+    list := pool.pending[from]
+    if list != nil && list.Overlaps(tx) {
+        // 替换或跳过交易
+        inserted, err := list.Add(tx, pool.config.PriceBump)
+        if !inserted {
+            return false, err
+        }
+        return true, nil
+    }
+    
+    // 添加到待处理列表
+    replaced, err = pool.enqueueTx(tx.Hash(), tx)
+    if err != nil {
+        return false, err
+    }
+    
+    return replaced, nil
+}
+
+// Gas 价格验证
+func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
+    // 检查 Gas 限制
+    if tx.Gas() > pool.currentMaxGas {
+        return ErrGasLimit
+    }
+    
+    // 检查 Gas 价格是否低于最低要求
+    if !local && tx.GasPriceIntCmp(pool.gasPrice) < 0 {
+        return ErrUnderpriced
+    }
+    
+    return nil
+}
+``` 
+#### **共识引擎接口**
+
+```go
+// consensus/consensus.go - 共识引擎接口定义
+type Engine interface {
+    // 作者检索方法（用于 PoW）
+    Author(header *types.Header) (common.Address, error)
+    
+    // 验证区块头
+    VerifyHeader(chain ChainReader, header *types.Header, seal bool) error
+    
+    // 准备共识相关的区块字段
+    Prepare(chain ChainReader, header *types.Header) error
+    
+    // 最终确定区块（应用状态变更）
+    Finalize(chain ChainReader, header *types.Header, state *state.StateDB, 
+             txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) error
+    
+    // 封存区块（PoW 挖矿或 PoS 签名）
+    Seal(chain ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error
+    
+    // 验证封印
+    VerifySeal(chain ChainReader, header *types.Header) error
+}
+
+// Ethash PoW 共识实现
+type Ethash struct {
+    config Config
+    // 缓存和数据集
+    caches   *lru
+    datasets *lru
+}
+
+// Seal 实现 PoW 挖矿
+func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, 
+                          results chan<- *types.Block, stop <-chan struct{}) error {
+    // 创建挖矿工作
+    abort := make(chan struct{})
+    found := make(chan *types.Block)
+    
+    ethash.lock.Lock()
+    threads := ethash.threads
+    ethash.lock.Unlock()
+    
+    // 启动多个挖矿线程
+    for i := 0; i < threads; i++ {
+        go func(id int, nonce uint64) {
+            ethash.mine(block, id, nonce, abort, found)
+        }(i, uint64(ethash.rand.Int63()))
+    }
+    
+    // 等待结果
+    select {
+    case block := <-found:
+        results <- block
+    case <-stop:
+        close(abort)
+    }
+    return nil
+}
+```
 
 ### 3.2.3 状态存储层
 该层负责管理区块链的所有状态数据：
 
-状态机：处理区块和交易，应用状态转换的核心引擎
+1. 状态机：处理区块和交易，应用状态转换的核心引擎
 
-Trie/MPT实现：Merkle Patricia Trie 数据结构，用于高效存储和验证状态
+2. Trie/MPT实现：Merkle Patricia Trie 数据结构，用于高效存储和验证状态
 
-LevelDB存储：持久化存储 Trie 节点数据、区块头和交易回执
+3. LevelDB存储：持久化存储 Trie 节点数据、区块头和交易回执
 
-core/types：定义区块、交易、收据等核心数据结构的模块
+4. core/types：定义区块、交易、收据等核心数据结构的模块
+
+**核心代码**
+#### **Trie (MPT) 实现**
+```go
+// trie/trie.go - Merkle Patricia Trie 核心实现
+type Trie struct {
+    root  node
+    owner common.Hash
+    // 数据库引用
+    db *Database
+}
+
+// 获取键值
+func (t *Trie) Get(key []byte) []byte {
+    value, _ := t.TryGet(key)
+    return value
+}
+
+func (t *Trie) TryGet(key []byte) ([]byte, error) {
+    key = keybytesToHex(key)
+    value, newroot, didResolve, err := t.tryGet(t.root, key, 0)
+    if err == nil && didResolve {
+        t.root = newroot
+    }
+    return value, err
+}
+
+// 插入键值
+func (t *Trie) Update(key, value []byte) {
+    if err := t.TryUpdate(key, value); err != nil {
+        log.Error(fmt.Sprintf("Unhandled trie error: %v", err))
+    }
+}
+
+func (t *Trie) TryUpdate(key, value []byte) error {
+    k := keybytesToHex(key)
+    if len(value) != 0 {
+        _, n, err := t.insert(t.root, nil, k, valueNode(value))
+        if err != nil {
+            return err
+        }
+        t.root = n
+    } else {
+        _, n, err := t.delete(t.root, nil, k)
+        if err != nil {
+            return err
+        }
+        t.root = n
+    }
+    return nil
+}
+
+// 计算 Merkle 根哈希
+func (t *Trie) Hash() common.Hash {
+    hash, cached, _ := t.hashRoot(nil)
+    t.root = cached
+    return common.BytesToHash(hash.(hashNode))
+}
+```
+#### **core/types 数据结构**
+```go
+// core/types/block.go - 区块数据结构
+type Block struct {
+    header       *Header
+    uncles       []*Header
+    transactions Transactions
+    
+    // 缓存
+    hash atomic.Value
+    size atomic.Value
+}
+
+type Header struct {
+    ParentHash  common.Hash    `json:"parentHash"       gencodec:"required"`
+    UncleHash   common.Hash    `json:"sha3Uncles"       gencodec:"required"`
+    Coinbase    common.Address `json:"miner"            gencodec:"required"`
+    Root        common.Hash    `json:"stateRoot"        gencodec:"required"`
+    TxHash      common.Hash    `json:"transactionsRoot" gencodec:"required"`
+    ReceiptHash common.Hash    `json:"receiptsRoot"     gencodec:"required"`
+    Bloom       Bloom          `json:"logsBloom"        gencodec:"required"`
+    Difficulty  *big.Int       `json:"difficulty"       gencodec:"required"`
+    Number      *big.Int       `json:"number"           gencodec:"required"`
+    GasLimit    uint64         `json:"gasLimit"         gencodec:"required"`
+    GasUsed     uint64         `json:"gasUsed"          gencodec:"required"`
+    Time        uint64         `json:"timestamp"        gencodec:"required"`
+    Extra       []byte         `json:"extraData"        gencodec:"required"`
+    MixDigest   common.Hash    `json:"mixHash"`
+    Nonce       BlockNonce     `json:"nonce"`
+}
+
+// core/types/transaction.go - 交易数据结构
+type Transaction struct {
+    inner TxData    // 交易数据
+    time  time.Time // 首次看到时间
+    
+    // 缓存
+    hash atomic.Value
+    size atomic.Value
+    from atomic.Value
+}
+
+type LegacyTx struct {
+    Nonce    uint64          // 账户交易序号
+    GasPrice *big.Int        // Gas 价格
+    Gas      uint64          // Gas 限制
+    To       *common.Address `rlp:"nil"` // 接收地址，nil 表示合约创建
+    Value    *big.Int        // 转账金额
+    Data     []byte          // 调用数据
+    V, R, S  *big.Int        // 签名数据
+}
+
+// EIP-1559 交易类型
+type DynamicFeeTx struct {
+    ChainID    *big.Int
+    Nonce      uint64
+    GasTipCap  *big.Int
+    GasFeeCap  *big.Int
+    Gas        uint64
+    To         *common.Address `rlp:"nil"`
+    Value      *big.Int
+    Data       []byte
+    AccessList AccessList
+    V, R, S    *big.Int
+}
+```
 
 ### 3.2.4 EVM 执行层
 该层是智能合约的沙箱化运行环境：
 
-EVM虚拟机：基于堆栈的智能合约执行引擎
+1. EVM虚拟机：基于堆栈的智能合约执行引擎
 
-字节码解释器：逐条解析和执行 EVM 操作码
+2. 字节码解释器：逐条解析和执行 EVM 操作码
 
-Gas计算器：计量和扣除每条指令的计算资源消耗
+3. Gas计算器：计量和扣除每条指令的计算资源消耗
 
-智能合约执行：在隔离环境中部署和运行智能合约代码
+4. 智能合约执行：在隔离环境中部署和运行智能合约代码
+
+**核心代码**
+#### **EVM 虚拟机核心**
+```go
+// core/vm/evm.go - EVM 虚拟机结构
+type EVM struct {
+    // 上下文
+    Context Context
+    // 状态数据库
+    StateDB StateDB
+    // 当前调用深度
+    depth int
+    
+    // 配置
+    chainConfig *params.ChainConfig
+    // 规则集
+    rules params.Rules
+    
+    // 解释器
+    interpreter *EVMInterpreter
+    // 中止标志
+    abort int32
+}
+
+// 合约调用
+func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, 
+                     gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
+    
+    // 检查调用深度
+    if evm.depth > int(params.CallCreateDepth) {
+        return nil, gas, ErrDepth
+    }
+    
+    // 检查余额是否足够
+    if !value.IsZero() && !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+        return nil, gas, ErrInsufficientBalance
+    }
+    
+    snapshot := evm.StateDB.Snapshot()
+    
+    // 转账
+    if !evm.StateDB.Exist(addr) {
+        // 合约创建
+        ret, _, err = evm.create(AccountRef(addr), input, gas, value)
+    } else {
+        // 合约调用
+        ret, err = evm.call(caller, addr, input, gas, value)
+    }
+    
+    if err != nil {
+        evm.StateDB.RevertToSnapshot(snapshot)
+    }
+    
+    return ret, gas, err
+}
+
+// EVM 解释器
+type EVMInterpreter struct {
+    evm *EVM
+    cfg Config
+    
+    // Gas 表
+    gasTable params.GasTable
+    // 读取指令的接口
+    readOnly bool
+}
+
+// 运行合约代码
+func (in *EVMInterpreter) Run(contract *Contract, input []byte) (ret []byte, err error) {
+    // 增加调用深度
+    in.evm.depth++
+    defer func() { in.evm.depth-- }()
+    
+    // 重置之前的返回数据
+    contract.ReturnData = nil
+    
+    if len(contract.Code) == 0 {
+        return nil, nil
+    }
+    
+    var (
+        op    OpCode        // 当前操作码
+        mem   = NewMemory() // 内存
+        stack = newstack()  // 栈
+        // ... 其他变量
+    )
+    
+    // 主循环
+    for {
+        // 获取下一个操作码
+        op = contract.GetOp(pc)
+        
+        // 计算 Gas 消耗
+        cost, err = operation.gasCost(in.gasTable, in.evm, contract, stack, mem, memorySize)
+        if err != nil || !contract.UseGas(cost) {
+            return nil, ErrOutOfGas
+        }
+        
+        // 执行操作
+        res, err := operation.execute(&pc, in.evm, contract, mem, stack)
+        if err != nil {
+            return nil, err
+        }
+        
+        // 检查是否中止
+        if in.evm.abort != 0 {
+            return nil, errStopToken
+        }
+    }
+}
+```
+#### **Gas 计算机制**
+```go
+// core/vm/gas.go - Gas 计算函数
+// 计算内存扩展的 Gas 消耗
+func memoryGasCost(mem *Memory, newMemSize uint64) (uint64, error) {
+    if newMemSize == 0 {
+        return 0, nil
+    }
+    
+    // 当前内存大小（以字为单位）
+    currentSize := toWordSize(mem.Len())
+    newSize := toWordSize(newMemSize)
+    
+    if newSize > 0xffffffffe0 {
+        return 0, errGasUintOverflow
+    }
+    
+    // 内存扩展的 Gas 消耗公式
+    if newSize > currentSize {
+        newWords := newSize - currentSize
+        newFee := (newWords * params.MemoryGas) + (newWords * newWords / params.QuadCoeffDiv)
+        oldFee := (currentSize * params.MemoryGas) + (currentSize * currentSize / params.QuadCoeffDiv)
+        totalFee := newFee - oldFee
+        
+        if totalFee > 0 && totalFee < newFee {
+            return totalFee, nil
+        }
+    }
+    return 0, nil
+}
+
+// 计算 SSTORE 操作的 Gas 消耗
+func gasSStore(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
+    var (
+        y, x = stack.Back(1), stack.Back(0)
+        current = evm.StateDB.GetState(contract.Address(), x.Bytes32())
+    )
+    
+    // EIP-1283 实现
+    original := evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
+    if original == current {
+        if original == (common.Hash{}) {
+            return params.SstoreSetGas, nil
+        }
+        if y == (common.Hash{}) {
+            return params.SstoreClearGas, nil
+        }
+        return params.SstoreResetGas, nil
+    }
+    
+    // 更复杂的 Gas 计算逻辑...
+    return params.SstoreResetGas, nil
+}
+```
 
 ## 3.3 数据流向说明
 架构中的数据流向遵循以下路径：
