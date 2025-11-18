@@ -68,6 +68,7 @@ PoS 过渡：Geth 在性能和与新兴以太坊升级（如以太坊 2.0 中从
 ## 3.1 分层架构图
 以下是 Geth 简化后的核心分层架构图，展示了各层级之间的依赖关系：
 
+​```plantuml
 @startuml
 package "P2P网络层" as NetworkLayer {
   [P2P协议] 
@@ -98,6 +99,7 @@ ProtocolLayer --> StorageLayer
 ProtocolLayer --> ExecutionLayer
 StorageLayer <--> ExecutionLayer
 @enduml
+​```
 
 ## 3.2 各层关键模块说明
 ### 3.2.1 P2P 网络层
